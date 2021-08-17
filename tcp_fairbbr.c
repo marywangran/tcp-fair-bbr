@@ -117,7 +117,8 @@ struct bbr {
 		cycle_idx:3,	/* current index in pacing_gain cycle array */
 		has_seen_rtt:1, /* have we seen an RTT sample yet? */
 		quick_probe:1,
-		unused_b:4;
+		probe_rtt_cnt:2,
+		unused_b:2;
 	u32	prior_cwnd;	/* prior cwnd upon entering loss recovery */
 	u32	full_bw;	/* recent bw, to estimate if pipe is full */
 
@@ -137,7 +138,8 @@ static const int bbr_bw_rtts = CYCLE_LEN + 2;
 /* Window length of min_rtt filter (in sec): */
 static const u32 bbr_min_rtt_win_sec = 10;
 /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
-static const u32 bbr_probe_rtt_mode_ms = 200;
+static const u32 bbr_probe_rtt_mode_ms = 20;
+static const u32 bbr_probe_rtt_cnt = 3;
 /* Skip TSO below the following bandwidth (bits/sec): */
 static const int bbr_min_tso_rate = 1200000;
 
@@ -803,6 +805,8 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 		bbr->rtt_cnt++;
 		bbr->round_start = 1;
 		bbr->packet_conservation = 0;
+		if (bbr->mode == BBR_PROBE_RTT)
+			bbr->probe_rtt_cnt++;
 	}
 
 	bbr_lt_bw_sampling(sk, rs);
@@ -944,7 +948,11 @@ static void bbr_check_probe_rtt_done(struct sock *sk)
 	if (!(bbr->probe_rtt_done_stamp &&
 	      after(tcp_jiffies32, bbr->probe_rtt_done_stamp)))
 		return;
+	
+	if (bbr->probe_rtt_cnt < bbr_probe_rtt_cnt)
+		return;
 
+	bbr->probe_rtt_cnt = 0;
 	bbr->min_rtt_stamp = tcp_jiffies32;  /* wait a while until PROBE_RTT */
 	tp->snd_cwnd = max(tp->snd_cwnd, bbr->prior_cwnd);
 	bbr_reset_mode(sk);
@@ -989,6 +997,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	if (bbr_probe_rtt_mode_ms > 0 && filter_expired &&
 	    !bbr->idle_restart && bbr->mode != BBR_PROBE_RTT) {
 		bbr->mode = BBR_PROBE_RTT;  /* dip, drain queue */
+		bbr->probe_rtt_cnt = 0;
 		bbr_save_cwnd(sk);  /* note cwnd so we can restore it */
 		bbr->probe_rtt_done_stamp = 0;
 	}
@@ -1111,6 +1120,7 @@ static void bbr_init(struct sock *sk)
 	bbr->full_bw_cnt = 0;
 	bbr->cycle_mstamp = 0;
 	bbr->cycle_idx = 0;
+	bbr->probe_rtt_cnt = 0;
 	bbr_reset_lt_bw_sampling(sk);
 	bbr_reset_startup_mode(sk);
 
